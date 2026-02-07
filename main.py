@@ -49,12 +49,21 @@ class QuizResponse(BaseModel):
     questions: List[QuizQuestion]
 
 class AssistRequest(BaseModel):
-    question: str
+    query: str
 
 class AssistResponse(BaseModel):
-    question: str
+    query: str
     answer: str
-    confidence: Optional[str] = None
+
+class EvaluateRequest(BaseModel):
+    question: str
+    options: List[str]
+    correct_answer: str
+
+class EvaluateResponse(BaseModel):
+    question: str
+    correct_answer: str
+    explanation: str
 
 
 def upload_to_gemini(file_path: str, mime_type: str = None):
@@ -238,102 +247,116 @@ async def generate_quiz(
 
 
 @app.post("/assist", response_model=AssistResponse)
-async def assist_with_course(
-    files: List[UploadFile] = File(..., description="Course materials for reference"),
-    question: str = Form(..., description="Your question about the course content")
-):
+async def assist_with_course(body: AssistRequest):
     """
-    Answer questions based on provided course materials.
-    
-    Analyzes course content (documents, images, videos) and provides
-    detailed answers to student questions using the context from the materials.
+    Answer a subject-related query. No files required.
+    Pass a query and get a clear, educational response.
     """
-    if not files:
-        raise HTTPException(status_code=400, detail="No course materials provided")
-    
-    if not question or question.strip() == "":
-        raise HTTPException(status_code=400, detail="Question cannot be empty")
-    
-    temp_paths = []
-    
+    if not body.query or not body.query.strip():
+        raise HTTPException(status_code=400, detail="query cannot be empty")
+
     try:
-        # Process uploaded files
-        file_parts, temp_paths = process_uploaded_files(files)
-        
-        # Create the prompt for answering
+        query_escaped = body.query.replace('"', '\\"')
         prompt = f"""
-        You are a knowledgeable course assistant. Based on the provided course materials 
-        (documents, images, and/or videos), answer the following student question in a 
-        clear, detailed, and educational manner.
-        
-        Student Question: {question}
-        
-        Provide a comprehensive answer that:
-        1. Directly addresses the question
-        2. References specific information from the course materials
-        3. Includes examples or explanations when helpful
-        4. Is accurate and educational
-        
-        If the question cannot be fully answered from the provided materials, 
-        acknowledge this and provide the best possible answer with available information.
-        
-        Return your response in the following STRICT JSON format:
+        You are a knowledgeable tutor. Answer the following query in a clear, accurate, and educational manner.
+        Be concise but thorough. If the query is about a subject (e.g. math, history, science), explain as appropriate.
+
+        Query: {body.query}
+
+        Return your response in the following STRICT JSON format only, with no extra text before or after:
         {{
-            "question": "{question}",
-            "answer": "Your detailed answer here",
-            "confidence": "high/medium/low based on how well the materials address the question"
+            "query": "{query_escaped}",
+            "answer": "Your detailed answer here"
         }}
-        
-        Ensure the response is valid JSON only, with no additional text before or after.
         """
-        
-        # Initialize the model
         model = genai.GenerativeModel(MODEL_NAME)
-        
-        # Create content parts: files first, then prompt
-        content_parts = file_parts + [prompt]
-        
-        # Generate content
         response = model.generate_content(
-            content_parts,
+            prompt,
             generation_config={
-                "temperature": 0.4,  # Lower temperature for more factual answers
+                "temperature": 0.4,
                 "top_p": 0.95,
                 "top_k": 40,
-                "max_output_tokens": 8192,
+                "max_output_tokens": 4096,
             }
         )
-        
-        # Parse the response
         response_text = response.text.strip()
-        
-        # Remove markdown code blocks if present
         if response_text.startswith("```json"):
             response_text = response_text[7:]
         if response_text.startswith("```"):
             response_text = response_text[3:]
         if response_text.endswith("```"):
             response_text = response_text[:-3]
-        
         response_text = response_text.strip()
-        
-        # Parse JSON
         assist_data = json.loads(response_text)
-        
         return JSONResponse(content=assist_data)
-    
     except json.JSONDecodeError as e:
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Failed to parse AI response as JSON: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Failed to parse AI response as JSON: {str(e)}")
     except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
+
+
+@app.post("/evaluate", response_model=EvaluateResponse)
+async def evaluate_answer(body: EvaluateRequest):
+    """
+    Given a question, multiple choice options, and the correct answer,
+    returns an explanation of why that answer is correct.
+    """
+    if not body.question or not body.question.strip():
+        raise HTTPException(status_code=400, detail="question cannot be empty")
+    if not body.options or len(body.options) < 2:
+        raise HTTPException(status_code=400, detail="options must have at least 2 choices")
+    opts_normalized = [o.strip() for o in body.options]
+    correct_normalized = body.correct_answer.strip() if body.correct_answer else ""
+    if not correct_normalized or correct_normalized not in opts_normalized:
         raise HTTPException(
-            status_code=500, 
-            detail=f"Error processing question: {str(e)}"
+            status_code=400,
+            detail="correct_answer must match one of the provided options (after trimming)"
         )
-    finally:
-        cleanup_temp_files(temp_paths)
+
+    try:
+        options_text = "\n".join(f"- {opt}" for opt in body.options)
+        question_escaped = body.question.replace('"', '\\"')
+        correct_escaped = body.correct_answer.replace('"', '\\"')
+        prompt = f"""
+        You are an educational expert. Given this multiple choice question and its correct answer, explain clearly why that answer is correct.
+
+        Question: {body.question}
+        Options:
+        {options_text}
+        Correct answer: {body.correct_answer}
+
+        Provide a concise but clear explanation (why this answer is right; you may briefly mention why others are wrong if helpful).
+        Return your response in the following STRICT JSON format only, with no extra text before or after:
+        {{
+            "question": "{question_escaped}",
+            "correct_answer": "{correct_escaped}",
+            "explanation": "Your explanation here"
+        }}
+        """
+        model = genai.GenerativeModel(MODEL_NAME)
+        response = model.generate_content(
+            prompt,
+            generation_config={
+                "temperature": 0.3,
+                "top_p": 0.95,
+                "top_k": 40,
+                "max_output_tokens": 2048,
+            }
+        )
+        response_text = response.text.strip()
+        if response_text.startswith("```json"):
+            response_text = response_text[7:]
+        if response_text.startswith("```"):
+            response_text = response_text[3:]
+        if response_text.endswith("```"):
+            response_text = response_text[:-3]
+        response_text = response_text.strip()
+        eval_data = json.loads(response_text)
+        return JSONResponse(content=eval_data)
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to parse AI response as JSON: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error evaluating answer: {str(e)}")
 
 
 @app.head("/health")
@@ -357,7 +380,8 @@ async def root():
         "message": "Quiz Generator & Course Assistant API",
         "endpoints": {
             "/generate-quiz": "POST - Generate quiz questions from course materials",
-            "/assist": "POST - Get answers to questions based on course content",
+            "/assist": "POST - Answer a subject-related query (body: { query })",
+            "/evaluate": "POST - Explain why an answer is correct (body: question, options, correct_answer)",
             "/health": "HEAD/GET - Health check endpoint"
         },
         "model": MODEL_NAME,
